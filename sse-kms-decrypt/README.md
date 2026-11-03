@@ -76,7 +76,7 @@ Three things a responder would want are missing from these events:
 
 The object ARN shows up in the allowed events because Bucket Key was off. With an S3 Bucket Key, S3 uses the bucket ARN as the encryption context, so the KMS events log the bucket instead of the object. In return a Bucket Key cuts KMS request costs by up to 99 percent, according to the [S3 Bucket Keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html) docs. That is a trade between cost and how exactly you can say which file was opened.
 
-**What surprised me.** Each read produced two `Decrypt` events in the same second, with different request IDs, but I ran each read once. I have not found out why yet, so I won't guess here.
+**Not yet explained.** Each read produced two `Decrypt` events in the same second, with different request IDs, though I ran each read once. I have not found out why, so I won't guess here.
 
 ## Alert on Denied Decrypts
 
