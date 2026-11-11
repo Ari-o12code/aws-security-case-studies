@@ -2,11 +2,11 @@
 
 *Tested 26 October 2026 in us-east-1, with the AWS CLI in CloudShell.*
 
-Encryption at rest only stops a reader when opening the file needs a second permission. This test shows when S3 gives you that second check, and what CloudTrail records when the check says no.
+A role with `s3:GetObject` and no KMS permission read a file from a bucket encrypted with SSE-S3, and was denied the same file in a bucket encrypted with SSE-KMS under a customer managed key. CloudTrail recorded the denial as a KMS `Decrypt` event with `AccessDenied`, but that event names neither the object that was requested nor the caller's IP address. This case study covers the test, the events it produced, an alert on denied decrypts and a policy that limits decryption to requests made through S3.
 
-## Set Up Two Buckets
+## Setup
 
-I put the same fake KYC file in two buckets. It holds a customer ID, a name and a BVN. The first bucket uses the default encryption, SSE-S3. The second uses SSE-KMS with a customer managed key, and S3 Bucket Key is off.
+I uploaded the same fake KYC file, which holds a customer ID, a name and a BVN, to two buckets. The first bucket uses the default encryption, SSE-S3, and the second uses SSE-KMS with a customer managed key and S3 Bucket Key turned off.
 
 I created the key and its alias as my admin user:
 
@@ -15,18 +15,18 @@ aws kms create-key --region us-east-1 --description "kms-lab: SSE-KMS writeup"
 aws kms create-alias --region us-east-1 --alias-name alias/kms-lab --target-key-id <key-id>
 ```
 
-The key has the default key policy. That policy gives the account root `kms:*`, so IAM policies decide who may use the key.
+The key has the default key policy, which gives the account root `kms:*`, so IAM policies decide who may use the key.
 
-Then I pointed the KMS bucket at that key, with Bucket Key off:
+I then set that key as the default encryption for the second bucket, with Bucket Key off:
 
 ```bash
 aws s3api put-bucket-encryption --bucket kmslab-ssekms-<suffix> --region us-east-1 \
   --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"},"BucketKeyEnabled":false}]}'
 ```
 
-The reader role is called `kms-lab-reader`. Its one inline policy allows `s3:ListBucket` and `s3:GetObject` on both buckets, and nothing else, so it has no KMS permission at all. That is the position a leaked credential or an over-scoped service role puts an attacker in. The role trusts the account, and I assumed it from my admin user with the session name `lab01`. Its policy is in [`policies/reader-policy.json`](policies/reader-policy.json) and its trust policy in [`policies/trust-policy.json`](policies/trust-policy.json).
+The reader role, `kms-lab-reader`, has one inline policy that allows `s3:ListBucket` and `s3:GetObject` on both buckets and nothing else, so it has no KMS permission. An attacker holding a leaked credential or an over-scoped service role would have the same access. The role trusts the account, and I assumed it from my admin user with the session name `lab01`. Its policy is in [`policies/reader-policy.json`](policies/reader-policy.json) and its trust policy is in [`policies/trust-policy.json`](policies/trust-policy.json).
 
-## Read Both Files as the Role
+## Reading Both Files as the Role
 
 As that role, I read the SSE-S3 file first:
 
@@ -34,15 +34,15 @@ As that role, I read the SSE-S3 file first:
 aws s3 cp s3://kmslab-sses3-<suffix>/kyc-sample.csv -
 ```
 
-It printed the file with no error. I didn't save that output. Under SSE-S3, `s3:GetObject` is the only permission that matters.
+The command printed the file with no error, although I did not save that output. Under SSE-S3, `s3:GetObject` is the only permission the read needs.
 
-Then I read the SSE-KMS file, with the same role and the same permissions:
+I then ran the same read against the SSE-KMS bucket, with the same role and permissions:
 
 ```bash
 aws s3 cp s3://kmslab-ssekms-<suffix>/kyc-sample.csv -
 ```
 
-This time it failed:
+The read failed with this error:
 
 ```
 download failed: s3://kmslab-ssekms-<suffix>/kyc-sample.csv to - An error occurred (AccessDenied)
@@ -52,13 +52,13 @@ arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab
 because no identity-based policy allows the kms:Decrypt action
 ```
 
-S3 allowed the read and KMS refused it.
+S3 authorized the request, and KMS denied the `kms:Decrypt` call that S3 made to decrypt the object.
 
-Next I gave the role one more statement. It allows `kms:Decrypt` on that key, but only when the call comes through S3 in us-east-1. It is in [`policies/decrypt-via-s3.json`](policies/decrypt-via-s3.json), and the Lock Decrypt to S3 section explains it. I ran the same read again and the file printed.
+I then added one statement to the role, which allows `kms:Decrypt` on that key only when the call comes through S3 in us-east-1. The statement is in [`policies/decrypt-via-s3.json`](policies/decrypt-via-s3.json) and is explained under Prevention. With it in place, the same read printed the file.
 
-## Find What CloudTrail Kept
+## CloudTrail Evidence
 
-These events come from CloudTrail Event history in us-east-1. The trimmed JSON is in [`evidence/`](evidence/).
+These events come from CloudTrail Event history in us-east-1, and the trimmed JSON is in [`evidence/`](evidence/).
 
 | UTC, 26 Oct | Event | Identity | Result | Encryption context |
 |---|---|---|---|---|
@@ -66,23 +66,23 @@ These events come from CloudTrail Event history in us-east-1. The trimmed JSON i
 | 18:46:44 | `Decrypt`, two events | `assumed-role/kms-lab-reader/lab01` | **AccessDenied** | none recorded |
 | 18:48:55 | `Decrypt`, two events | `assumed-role/kms-lab-reader/lab01` | allowed | `kmslab-ssekms-<suffix>/kyc-sample.csv` |
 
-Every one of these events has `invokedBy` and `sourceIPAddress` set to `fas.s3.amazonaws.com`. Neither the role nor my admin user called KMS directly. S3 called KMS for them, through a forward access session. AWS still checks the original caller on both services, so the read only works if the identity can read the object and use the key. AWS explains this in its page on [forward access sessions](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html).
+Every one of these events has `invokedBy` and `sourceIPAddress` set to `fas.s3.amazonaws.com`, because neither the role nor my admin user called KMS directly. S3 called KMS on their behalf through a [forward access session](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html). AWS still evaluates the original caller's permissions on both services, so the read succeeds only if the identity can read the object and use the key.
 
 Three things a responder would want are missing from these events:
 
-- The object read itself. A lookup for `GetObject` over the same window returned `0`, because object reads are S3 data events. Event history holds management events only, and data events need a trail set up to record them.
-- The caller's IP address. The KMS events show `fas.s3.amazonaws.com` as the source, not the address the request came from. To find who was reading, you need the S3 data event for the same request.
-- The file the denied request wanted. The denied `Decrypt` has `requestParameters: null`, so there is no encryption context. The allowed one names the object. When KMS refuses, it tells you who and which key, but not which file.
+- The object read. A lookup for `GetObject` over the same window returned `0` events, because object reads are S3 data events. Event history holds management events only, and data events are recorded only by a trail that is configured to log them.
+- The caller's IP address. The KMS events give `fas.s3.amazonaws.com` as the source, so the address the request came from appears only in the S3 data event for the same request.
+- The object the denied request asked for. The denied `Decrypt` event has `requestParameters: null` and so carries no encryption context, while the allowed event names the object. A denied event therefore identifies the principal and the key, and does not identify the file.
 
-The object ARN shows up in the allowed events because Bucket Key was off. With an S3 Bucket Key, S3 uses the bucket ARN as the encryption context, so the KMS events log the bucket instead of the object. In return a Bucket Key cuts KMS request costs by up to 99 percent, according to the [S3 Bucket Keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html) docs. That is a trade between cost and how exactly you can say which file was opened.
+The object ARN appears in the allowed events because Bucket Key was off. With an S3 Bucket Key, S3 uses the bucket ARN as the encryption context, so the KMS events record the bucket and no longer record the object. A Bucket Key reduces KMS request costs by up to 99 percent, according to the [S3 Bucket Keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html) documentation, so the choice trades KMS cost against the ability to tell from KMS events which object was decrypted.
 
-Each read produced two `Decrypt` events in the same second, with different request IDs, though I ran each read once. I have not found out why, so I won't guess here.
+Each read produced two `Decrypt` events in the same second with different request IDs, although I ran each read once. I have not found out why.
 
-## Alert on Denied Decrypts
+## Detection
 
-Alert on a KMS `Decrypt` with `errorCode` `AccessDenied` against a key that guards sensitive data, and name the principal in the alert. One refusal can be a broken job. A role that has never used the key and suddenly tries is worth a look the same day.
+The event to alert on is a KMS `Decrypt` with `errorCode` `AccessDenied` against a key that protects sensitive data, with the principal named in the alert. A single denial can come from a misconfigured job, whereas a denial from a role that has never used the key should be investigated the same day.
 
-Both versions below need a CloudTrail trail, because Event history cannot alert. I have not run them yet.
+Both versions below need a CloudTrail trail, because Event history cannot trigger alerts. I have not run either of them yet.
 
 The first is an EventBridge rule pattern:
 
@@ -98,7 +98,7 @@ The first is an EventBridge rule pattern:
 }
 ```
 
-`Decrypt` is a read-only management event, so the rule only matches when its state is `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`. A rule in the plain `ENABLED` state never fires for it, as the [EventBridge docs](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-service-event-cloudtrail.html) explain.
+`Decrypt` is a read-only management event, so the rule matches only when its state is `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`. A rule in the `ENABLED` state does not receive read-only events, as the [EventBridge docs](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-service-event-cloudtrail.html) explain.
 
 The second is an Athena query over a table built on the trail's logs:
 
@@ -114,13 +114,13 @@ WHERE eventsource = 'kms.amazonaws.com'
 ORDER BY eventtime DESC;
 ```
 
-## Lock Decrypt to S3
+## Prevention
 
-Two choices keep `s3:GetObject` from being enough to read the file, and they go together.
+Two controls together stop `s3:GetObject` alone from being enough to read the file.
 
-First, use a customer managed key, not the AWS managed key `aws/s3`. The managed key lets any principal in the account use it through S3, as this [AWS re:Post answer](https://www.repost.aws/questions/QUUFBF6OvvREuaXKzRurcPQA/why-can-s3-access-the-kms-key-resource-under-my-account) explains. So a role with `s3:GetObject` can read the file, and there is no second check. With a customer managed key, decrypt is a separate permission you grant on purpose.
+The first is to encrypt with a customer managed key in place of the AWS managed key `aws/s3`. The AWS managed key can be used through S3 by any principal in the account, as this [AWS re:Post answer](https://www.repost.aws/questions/QUUFBF6OvvREuaXKzRurcPQA/why-can-s3-access-the-kms-key-resource-under-my-account) explains, so a role with `s3:GetObject` can read the file with no second authorization. With a customer managed key, `kms:Decrypt` is a separate permission that has to be granted.
 
-Second, grant `kms:Decrypt` only through S3:
+The second is to grant `kms:Decrypt` only for requests made through S3:
 
 ```json
 {
@@ -132,14 +132,14 @@ Second, grant `kms:Decrypt` only through S3:
 }
 ```
 
-The `kms:ViaService` condition means the role can decrypt only as part of an S3 read. It cannot call `kms:Decrypt` on the key directly.
+With the `kms:ViaService` condition, the role can decrypt only as part of an S3 request and cannot call `kms:Decrypt` on the key directly.
 
-This does not cover everything. Stolen copies of the role's credentials can still read whatever the S3 grant allows, so keep that grant as narrow as the key grant. And here the default key policy hands the decision to IAM, so anyone who can edit IAM policies can grant decrypt. For real customer data I would name the allowed roles in the key policy itself. Then the key's owner decides who reads, not whoever has IAM write access. That control goes into Terraform when my lab organization starts in November.
+These controls have two limits. Stolen credentials for the role can still read whatever its S3 permissions allow, so those permissions should be as narrow as the key grant. The default key policy also delegates the decision to IAM, which means anyone who can edit IAM policies can grant `kms:Decrypt`. For real customer data I would name the allowed roles in the key policy itself, so that the key's administrators decide who can decrypt. I will write that control in Terraform when my lab organization is built.
 
-## What It Costs a Business
+## Business Cost
 
-Picture a fintech's KYC bucket under SSE-S3. Any credential with `s3:GetObject` on it can download every customer's ID documents and BVN, whether it belongs to an analytics job or leaked from CI. The business is then left notifying customers and the data protection regulator. Now add a customer managed key, with decrypt granted only to the one service that needs it. The same credential gets AccessDenied, and the refusal sits in CloudTrail with the role's name on it. One key policy turns a breach into a refusal you can alert on.
+If a bucket of KYC documents is encrypted with SSE-S3, any credential with `s3:GetObject` on it can download every customer's ID documents and BVN, whether the credential belongs to an analytics job or was leaked from CI. The business then has to notify its customers and the data protection regulator. If the bucket uses a customer managed key and `kms:Decrypt` is granted only to the service that needs it, the same credential receives `AccessDenied`, and CloudTrail records the denial with the role's name.
 
-## What I Would Check Next
+## Next Check
 
-I would repeat the reads with S3 data events turned on. That pairs each `Decrypt` with the `GetObject` behind it, shows the caller's real IP, and may show where the second `Decrypt` comes from.
+I would repeat the reads with S3 data events turned on, which would pair each `Decrypt` event with its `GetObject` event, record the caller's IP address, and might show where the second `Decrypt` event comes from.
